@@ -209,6 +209,31 @@ def answer_actions(
     ]
 
 
+def prompt_actions(
+    secret: str, url: str, token: str, labels: Sequence[str]
+) -> list[dict[str, Any]]:
+    """The buttons a direct prompt offers, the last of them its way out.
+
+    Built as a card's answer buttons are, so a press reads back as the same
+    `Press`. Named by the label alone rather than numbered: a prompt's labels
+    are the numbers, and numbering them would put "1. 47" on a button.
+    """
+    actions: list[dict[str, Any]] = []
+    for position, label in enumerate(labels, start=1):
+        action: dict[str, Any] = {
+            "id": f"switch{position}",
+            "name": label,
+            "integration": {
+                "url": url,
+                "context": action_context(secret, token, position),
+            },
+        }
+        if position == len(labels):
+            action["style"] = "danger"
+        actions.append(action)
+    return actions
+
+
 def _button_name(control: Control) -> str:
     """What the button says: the option's number, then the option.
 

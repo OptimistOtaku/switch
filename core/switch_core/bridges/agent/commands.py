@@ -29,6 +29,11 @@ from switch_core.bridges.agent.protocol.types import (
     AgentStatus,
     CommandPayload,
 )
+from switch_core.chat_account_links import (
+    LINK_USAGE,
+    confirm_with_code,
+    unlink_account,
+)
 from switch_core.clients.admin_messages import AdminMessageType
 from switch_core.clients.mentions import mention_tokens as _mention_tokens
 from switch_core.db.audit import AuditAction, record_audit_event
@@ -43,7 +48,6 @@ from switch_core.db.models import (
 )
 from switch_core.db.session_scope import tenant_session
 from switch_core.db.stores.agent_runtime_state_store import AgentRuntimeStateStore
-from switch_core.db.stores.external_user_store import CodeNotAccepted, NoSuchLink
 from switch_core.db.stores.session_activity_store import (
     RETRYABLE_TURN_STATUSES,
     AgentSessionActivityStore,
@@ -1438,87 +1442,34 @@ async def _cmd_link_account(
 ) -> None:
     """Confirm a link to a Switch user with the code Console showed (CHOO-3881).
 
-    Only the Switch user was shown the code, and the platform says which
-    account posted it, so a match proves one person holds both. A code posted
-    from any other account matches nothing, which is why posting it in a busy
-    channel gives nothing away.
+    The bridge that hears this answers it itself (`chat_account_links`), so it
+    only reaches a room when someone types it there without a chat account:
+    in Console, or as an agent. The same function answers either way.
     """
     host = cast("CommandConsumer", client)
     code = (event.args or "").strip()
     if not code:
-        await _reply(
-            host,
-            room,
-            event,
-            "Usage: `!link-account CODE`, with the code Switch Console showed "
-            "you when you linked this account.",
-        )
+        await _reply(host, room, event, LINK_USAGE)
         return
 
-    # Replies wait until the session has closed: a rejected code may have
-    # locked the request it was checked against, and nobody should wait on
-    # that while a reply is written.
-    refusal: str | None = None
+    # Replied after the session has closed: a rejected code may have locked
+    # the request it was checked against.
     async with host.session_factory() as session:
         account = await _sender_account(host, session, event)
         if account is None:
-            refusal = (
+            reply = (
                 "⚠️ Only a chat account can confirm a link to itself, by posting "
                 "the code from that account."
             )
         else:
-            try:
-                request = await host._external_user_store.redeem_link_code(
-                    session, account, code, host._user_store
-                )
-            except CodeNotAccepted:
-                refusal = (
-                    "⚠️ That code doesn't match a link waiting for this account, "
-                    "or it has expired. Get a new code in Switch Console, and post "
-                    "it from the account you're linking."
-                )
-            else:
-                user_id = request.user_id
-                linked = await host._user_store.get(session, user_id)
-                bridge = await session.get(CollaborationBridge, account.bridge_id)
-                # Both are held by foreign keys from the rows just written.
-                if linked is None or bridge is None:
-                    raise RuntimeError(
-                        f"Confirmed a link for user {user_id} on bridge "
-                        f"{account.bridge_id}, but could not read either back"
-                    )
-                name, platform = linked.name, bridge.display_name
-                username = account.external_username
-                await record_audit_event(
-                    session,
-                    tenant_id=account.tenant_id,
-                    actor_user_id=user_id,
-                    action=AuditAction.BRIDGE_IDENTITY_CLAIMED,
-                    target_type="external_user",
-                    target_id=account.id,
-                    details={
-                        "bridge_id": account.bridge_id,
-                        "user_id": user_id,
-                        "by": "code",
-                    },
-                )
-                await session.commit()
-    if refusal is not None:
-        await _reply(host, room, event, refusal)
-        return
-
-    # Names the Switch user, so whoever posted it sees who the account is now
-    # recognised as, and how to take that back if it is not them. "The way you
-    # ran this" because platforms differ in how a command reaches Switch: typed
-    # with `!`, as a slash command, or with the app mentioned.
-    await _reply(
-        host,
-        room,
-        event,
-        f"✅ Linked this {platform} account ({username}) to Switch user "
-        f"**{name}**. If that isn't you, run `unlink-account {name}` the way "
-        "you ran this command.",
-    )
+            reply = await confirm_with_code(
+                session,
+                external_user_store=host._external_user_store,
+                user_store=host._user_store,
+                account=account,
+                code=code,
+            )
+    await _reply(host, room, event, reply)
 
 
 async def _cmd_unlink_account(
@@ -1526,98 +1477,24 @@ async def _cmd_unlink_account(
 ) -> None:
     """Show which Switch users this chat account is linked to, or remove one.
 
-    The account's own say over its links, for someone who has no Switch login
-    to fix one with: a link confirmed by mistake, or one made before links
-    needed confirming. It only ever touches the account that sent it.
+    Answered by the bridge that hears it, like `link-account`; see there.
     """
     host = cast("CommandConsumer", client)
-    wanted = _strip_quotes((event.args or "").strip())
     async with host.session_factory() as session:
-        reply = await _unlink_account(host, session, event, wanted)
+        account = await _sender_account(host, session, event)
+        if account is None:
+            reply = "⚠️ Only a chat account can unlink itself, from that account."
+        else:
+            reply = await unlink_account(
+                session,
+                external_user_store=host._external_user_store,
+                user_store=host._user_store,
+                account=account,
+                wanted=event.args or "",
+            )
     # After the session has closed, so no lock is held while the reply is
     # written.
     await _reply(host, room, event, reply)
-
-
-async def _unlink_account(
-    host: CommandConsumer, session: AsyncSession, event: CommandEvent, wanted: str
-) -> str:
-    """`!unlink-account`'s work, returning what to reply."""
-    account = await _sender_account(host, session, event)
-    if account is None:
-        return "⚠️ Only a chat account can unlink itself, from that account."
-    claims = (await host._external_user_store.claims_for(session, [account.id])).get(
-        account.id, []
-    )
-    users = {
-        user.id: user
-        for user in await host._user_store.get_many(
-            session, [c.user_id for c in claims]
-        )
-    }
-    linked = sorted(
-        (
-            (users[c.user_id].name, users[c.user_id].email, c)
-            for c in claims
-            if c.user_id in users
-        ),
-        key=lambda entry: entry[0].casefold(),
-    )
-    listing = "\n".join(
-        f"- **{name}**"
-        + (
-            ""
-            if claim.verified_at is not None
-            else " (made before links needed confirming)"
-        )
-        for name, _email, claim in linked
-    )
-
-    if not wanted:
-        if not linked:
-            return "This account isn't linked to any Switch user."
-        return (
-            f"This account is linked to:\n{listing}\n\nRun "
-            "`!unlink-account NAME` to remove one."
-        )
-
-    needle = wanted.casefold()
-    matches = [
-        claim
-        for name, email, claim in linked
-        if needle in (name.casefold(), email.casefold())
-    ]
-    if not matches:
-        return f"⚠️ This account isn't linked to a Switch user called **{wanted}**." + (
-            f" It is linked to:\n{listing}" if linked else ""
-        )
-    if len(matches) > 1:
-        return (
-            f"⚠️ More than one Switch user linked to this account goes by "
-            f"**{wanted}**. Run `!unlink-account` with their email instead."
-        )
-    user_id = matches[0].user_id
-    name = users[user_id].name
-    try:
-        await host._external_user_store.release(session, account, user_id)
-    except NoSuchLink:
-        # Unlinked some other way while this ran: the outcome asked for.
-        return f"This account is no longer linked to Switch user **{name}**."
-    await record_audit_event(
-        session,
-        tenant_id=account.tenant_id,
-        actor_user_id=None,
-        action=AuditAction.BRIDGE_IDENTITY_RELEASED,
-        target_type="external_user",
-        target_id=account.id,
-        details={
-            "bridge_id": account.bridge_id,
-            "user_id": user_id,
-            "by": "chat_account",
-        },
-    )
-    await session.commit()
-    return f"Unlinked this account from Switch user **{name}**."
 
 
 async def _cmd_rename_agent(

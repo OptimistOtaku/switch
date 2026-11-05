@@ -31,7 +31,9 @@ from switch_core.bridges.collaboration.models import (
     ChannelCreationUnsupported,
     ChannelRetirement,
     ChannelType,
+    DirectMessageUnavailable,
     DirectoryUser,
+    DirectPrompt,
     FailureReason,
     InboundAgentJoin,
     InboundAppJoin,
@@ -2035,6 +2037,57 @@ class PlatformAdapter(ABC):
             self.platform_name,
         )
         return False
+
+    async def answer_command(self, command: InboundCommand, text: str) -> None:
+        """Answer a command the bridge handles itself, without a room
+        (`chat_account_links.ACCOUNT_COMMANDS`).
+
+        `text` is Switch Markdown. This base posts it in the channel the
+        command came from, threaded under it, as the bridge: what an in-room
+        answer used to look like, without the room. A platform with a private
+        reply to a command, carried in `command.reply_ref`, overrides it so
+        only the sender sees the answer, wherever they ran it.
+        """
+        await self.admin_message(
+            command.channel_id,
+            text,
+            command.root_id or command.message_ref,
+        )
+
+    async def send_direct_prompt(
+        self, external_user_id: str, prompt: DirectPrompt
+    ) -> str:
+        """Message `external_user_id` directly with `prompt`, and return the
+        message's ref in the form a press on it carries back
+        (`InboundInteraction.message_ref`).
+
+        Each button carries `prompt.token` and its position the way this
+        platform's card buttons carry theirs, so a press arrives on the
+        ordinary interaction path.
+
+        Raises `DirectMessageUnavailable`, saying why for the Switch user, when
+        this platform cannot reach the person directly. This base is such a
+        platform.
+        """
+        raise DirectMessageUnavailable(
+            f"Switch can't send direct messages on {self.display_name}, so use "
+            "the code instead."
+        )
+
+    async def settle_direct_prompt(self, message_ref: str, text: str) -> None:
+        """Replace a prompt sent by `send_direct_prompt` with `text` (Switch
+        Markdown) and no buttons, once it has been answered.
+
+        Best effort, and must not raise: the answer has already been recorded,
+        and a message still showing buttons only invites a press that will be
+        told so.
+        """
+        logger.warning(
+            "%s cannot replace the direct prompt %s. It was answered: %s",
+            self.display_name,
+            message_ref,
+            text,
+        )
 
     async def tell_actor(
         self,
